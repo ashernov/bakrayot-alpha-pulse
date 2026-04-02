@@ -3,8 +3,8 @@
   "configurations": [
     {
       "name": "bakrayot-alpha-pulse (Wrangler Dev)",
-      "runtimeExecutable": "npx",
-      "runtimeArgs": ["wrangler", "dev", "--local"],
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "C:\\Asher\\Alpha-Pulse\\wrangler-dev.cmd"],
       "port": 8787
     }
   ]
