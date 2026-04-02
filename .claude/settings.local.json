@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm --version)",
+      "Bash(npx wrangler:*)",
+      "Bash(cmd.exe /c \"winget --version\")",
+      "Bash(cmd.exe /c \"winget install OpenJS.NodeJS.LTS --accept-source-agreements --accept-package-agreements --silent\")",
+      "Bash(export PATH=\"/c/Program Files/nodejs:$PATH\")",
+      "Bash(export PATH=\"$PATH:/c/Users/HUB C/AppData/Roaming/npm\")",
+      "Bash(wrangler --version)"
+    ]
+  }
+}

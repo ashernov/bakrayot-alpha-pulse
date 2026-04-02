@@ -1,0 +1,13 @@
+name = "bakrayot-alpha-pulse"
+account_id = "f7e821c3d4440f0364c8f614e229f747"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[triggers]
+crons = ["0 16 * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "bakrayot-alpha"
+database_id = "36fbeba0-2c5b-4b46-99cc-4509a7afccb3"
