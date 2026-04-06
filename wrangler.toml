@@ -15,3 +15,7 @@ database_id = "36fbeba0-2c5b-4b46-99cc-4509a7afccb3"
 [[kv_namespaces]]
 binding = "BOT_SESSIONS"
 id      = "09812819e1584414abcbcd357537bae6"
+
+[[kv_namespaces]]
+binding = "KV"
+id      = "09812819e1584414abcbcd357537bae6"

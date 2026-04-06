@@ -5,8 +5,12 @@
 export interface Env {
   DB: D1Database;
   BOT_SESSIONS: KVNamespace;
+  KV: KVNamespace;
   TELEGRAM_BOT_TOKEN: string;
   LEADS_API_KEY: string;
+  GROW_WEBHOOK_KEY: string;
+  MORNING_API_ID: string;
+  MORNING_API_SECRET: string;
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -49,6 +53,11 @@ export default {
     // Lead ingestion
     if (request.method === "POST" && url.pathname === "/leads") {
       return handleLeadIngestion(request, env);
+    }
+
+    // Grow webhook — financial closing loop
+    if (request.method === "POST" && url.pathname === "/api/webhooks/grow") {
+      return handleGrowWebhook(request, env);
     }
 
     // #7 — Webhook: only exact token path accepted; everything else → 200 (silent)
@@ -487,6 +496,179 @@ async function tgSend(env: Env, chatId: number, text: string): Promise<void> {
     }
   } catch (err) {
     console.error(`[tg] sendMessage threw chat=${chatId}:`, (err as Error).message);
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Utility: safeCompare — constant-time string comparison (no crypto import)
+// ═════════════════════════════════════════════════════════════════════════════
+
+function safeCompare(a: string, b: string): boolean {
+  const aBytes = new TextEncoder().encode(a);
+  const bBytes = new TextEncoder().encode(b);
+  if (aBytes.byteLength !== bBytes.byteLength) return false;
+  let diff = 0;
+  for (let i = 0; i < aBytes.byteLength; i++) {
+    diff |= aBytes[i] ^ bBytes[i];
+  }
+  return diff === 0;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Utility: fetchWithTimeout — 8 s hard limit via AbortController
+// ═════════════════════════════════════════════════════════════════════════════
+
+function fetchWithTimeout(url: string, options?: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  return Promise.race([
+    fetch(url, { ...options, signal: controller.signal }).then((res) => {
+      clearTimeout(timer);
+      return res;
+    }),
+    new Promise<never>((_resolve, reject) =>
+      setTimeout(() => {
+        controller.abort();
+        reject(new Error("fetchWithTimeout: request timed out after 8000ms"));
+      }, 8000)
+    ),
+  ]);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Morning API — generate legal green invoice document
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function generateLegalDocument(
+  env: Env,
+  token: string,
+  transactionCode: string,
+  amount: number
+): Promise<void> {
+  const res = await fetchWithTimeout(
+    "https://api.greeninvoice.co.il/api/v1/documents",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        type: 320,                    // Green Invoice: tax invoice receipt
+        lang: "he",
+        currency: "ILS",
+        vatType: 0,
+        income: [
+          {
+            catalogNum: transactionCode,
+            description: `עסקה ${transactionCode}`,
+            quantity: 1,
+            price: amount,
+            currency: "ILS",
+            vatType: 0,
+          },
+        ],
+      }),
+    }
+  );
+  if (!res.ok) {
+    const text = await res.text().catch(() => "unreadable");
+    throw new Error(`[grow] Morning API error status=${res.status}: ${text}`);
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// POST /api/webhooks/grow — financial closing loop (7 steps)
+// ═════════════════════════════════════════════════════════════════════════════
+
+async function handleGrowWebhook(request: Request, env: Env): Promise<Response> {
+  try {
+    // Step 1 — authenticate via webhookKey in body
+    let rawBody: Record<string, unknown>;
+    try {
+      rawBody = await request.json();
+    } catch {
+      return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+        status: 400, headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    const webhookKey = typeof rawBody.webhookKey === "string" ? rawBody.webhookKey : "";
+    if (!safeCompare(webhookKey, env.GROW_WEBHOOK_KEY)) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401, headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // Step 2 — parse payload
+    const transactionCode = typeof rawBody.transactionCode === "string"
+      ? rawBody.transactionCode.trim()
+      : null;
+    const amount = typeof rawBody.amount === "number" ? rawBody.amount : null;
+
+    if (!transactionCode || amount === null) {
+      return new Response(JSON.stringify({ error: "transactionCode (string) and amount (number) are required" }), {
+        status: 400, headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // Step 3 — idempotency check
+    const idemKey = `idem:${transactionCode}`;
+    const idemVal = await env.KV.get(idemKey);
+    if (idemVal) {
+      return new Response(JSON.stringify({ success: true, idempotent: true }), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // Step 4 — get or refresh Morning API token
+    let morningToken = await env.KV.get("morning:token");
+    if (!morningToken) {
+      const authRes = await fetchWithTimeout(
+        "https://api.greeninvoice.co.il/api/v1/account/token",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: env.MORNING_API_ID, secret: env.MORNING_API_SECRET }),
+        }
+      );
+      if (!authRes.ok) {
+        const text = await authRes.text().catch(() => "unreadable");
+        throw new Error(`[grow] Morning auth failed status=${authRes.status}: ${text}`);
+      }
+      const authData = await authRes.json() as { token?: string };
+      if (!authData.token) {
+        throw new Error("[grow] Morning auth response missing token field");
+      }
+      morningToken = authData.token;
+      await env.KV.put("morning:token", morningToken, { expirationTtl: 3300 });
+    }
+
+    // Step 5 — generate legal document (green invoice)
+    await generateLegalDocument(env, morningToken, transactionCode, amount);
+
+    // Step 6 — D1 batch: deduct agent balance + mark lead as WON
+    await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE agents SET balance = balance - (? * 0.10) WHERE id = (SELECT assigned_to FROM leads_clean WHERE transaction_code = ?)`
+      ).bind(amount, transactionCode),
+      env.DB.prepare(
+        `UPDATE leads_clean SET status = 'WON', updated_at = CURRENT_TIMESTAMP WHERE transaction_code = ?`
+      ).bind(transactionCode),
+    ]);
+
+    // Step 7 — mark idempotency key and return success
+    await env.KV.put(idemKey, "done", { expirationTtl: 2592000 });
+
+    console.log(`[grow] CLOSED transactionCode=${transactionCode} amount=${amount}`);
+
+    return new Response(JSON.stringify({ success: true }), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    });
+  } catch (error) {
+    const err = error as Error;
+    await env.KV.put(`errors:${Date.now()}`, err.stack ?? err.message);
+    throw error;
   }
 }
 
