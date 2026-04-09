@@ -10,8 +10,3 @@ binding = "AI"
 binding = "DB"
 database_name = "hub-memory"
 database_id = "36fbeba0-2c5b-4b46-99cc-4509a7afccb3"
-
-[vars]
-TELEGRAM_BOT_TOKEN = ""
-ADMIN_CHAT_ID = ""
-HUB_AUTH_KEY = ""

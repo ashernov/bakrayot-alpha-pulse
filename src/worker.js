@@ -1,34 +1,29 @@
-// ─── God Node — Thin-Client Control Plane ────────────────────────────────────
+// ─── God Node — Thin-Client Control Plane v1 ─────────────────────────────────
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-    const { method } = request;
-    const path = url.pathname;
+    const url    = new URL(request.url);
+    const method = request.method;
+    const path   = url.pathname;
 
-    if (method === 'GET' && path === '/health') {
-      return Response.json({
-        status: 'alive',
-        pulse: '0010110',
-        architecture: 'thin_client_god_node',
-      });
-    }
-
-    if (method === 'POST' && path === '/bus') {
-      return handleBus(request, env);
-    }
-
-    if (method === 'POST' && path === '/telegram') {
-      return handleTelegram(request, env);
-    }
-
-    if (method === 'GET' && path === '/state') {
-      return handleState(request, env);
-    }
+    if (method === 'GET'  && path === '/health')   return handleHealth();
+    if (method === 'POST' && path === '/bus')       return handleBus(request, env);
+    if (method === 'POST' && path === '/telegram')  return handleTelegram(request, env);
+    if (method === 'GET'  && path === '/state')     return handleState(request, env);
 
     return Response.json({ error: 'Not Found' }, { status: 404 });
   },
 };
+
+// ─── GET /health ──────────────────────────────────────────────────────────────
+
+function handleHealth() {
+  return Response.json({
+    status:       'alive',
+    pulse:        '0010110',
+    architecture: 'thin_client_god_node',
+  });
+}
 
 // ─── POST /bus ────────────────────────────────────────────────────────────────
 
@@ -44,25 +39,12 @@ async function handleBus(request, env) {
     return Response.json({ error: 'Invalid JSON' }, { status: 400 });
   }
 
-  const rawInput = typeof body.message === 'string' ? body.message : JSON.stringify(body);
-  const source   = typeof body.source  === 'string' ? body.source  : 'pixel';
+  const rawInput = typeof body.message   === 'string' ? body.message   : JSON.stringify(body);
+  const source   = typeof body.source    === 'string' ? body.source    : 'pixel';
+  const sourceId = typeof body.source_id === 'string' ? body.source_id : crypto.randomUUID();
 
-  const ai = await runAI(env, rawInput);
-  const id = crypto.randomUUID();
-
-  await env.DB.prepare(
-    'INSERT INTO universal_memory (id, source, intent, raw_input, ai_response) VALUES (?, ?, ?, ?, ?)'
-  ).bind(id, source, ai.intent, rawInput, ai.response).run();
-
-  if (ai.intent === 'hot_lead' || ai.intent === 'task') {
-    await tgSend(
-      env,
-      env.ADMIN_CHAT_ID,
-      `[${ai.intent.toUpperCase()}] ${source}\n\n${rawInput}\n\n→ ${ai.response}`
-    );
-  }
-
-  return Response.json({ id, intent: ai.intent, response: ai.response });
+  const result = await handleInput(env, { source, sourceId, rawInput });
+  return Response.json(result);
 }
 
 // ─── POST /telegram ───────────────────────────────────────────────────────────
@@ -78,18 +60,16 @@ async function handleTelegram(request, env) {
   const msg = body?.message;
   if (!msg) return new Response('OK');
 
-  const chatId   = msg.chat?.id;
+  const chatId   = String(msg.chat?.id ?? '');
+  const sourceId = String(msg.message_id ?? crypto.randomUUID());
   const rawInput = typeof msg.text === 'string' ? msg.text : JSON.stringify(msg);
 
-  const ai = await runAI(env, rawInput);
-  const id = crypto.randomUUID();
+  if (!rawInput) return new Response('OK');
 
-  await env.DB.prepare(
-    'INSERT INTO universal_memory (id, source, intent, raw_input, ai_response) VALUES (?, ?, ?, ?, ?)'
-  ).bind(id, 'telegram', ai.intent, rawInput, ai.response).run();
+  const result = await handleInput(env, { source: 'telegram', sourceId, rawInput });
 
-  if (chatId) {
-    await tgSend(env, String(chatId), ai.response);
+  if (chatId && result.status === 'ok') {
+    await tgSend(env, chatId, result.response);
   }
 
   return new Response('OK');
@@ -109,6 +89,89 @@ async function handleState(request, env) {
   return Response.json({ rows: result.results });
 }
 
+// ─── Core loop ────────────────────────────────────────────────────────────────
+
+async function handleInput(env, { source, sourceId, rawInput }) {
+  const id     = crypto.randomUUID();
+  const dedupe = await dedupeKey(source, sourceId, rawInput);
+
+  // Idempotency: return existing record if already processed
+  try {
+    const existing = await env.DB.prepare(
+      'SELECT id, intent, ai_response FROM universal_memory WHERE dedupe_key = ?'
+    ).bind(dedupe).first();
+
+    if (existing) {
+      return {
+        id:       existing.id,
+        intent:   existing.intent,
+        response: existing.ai_response,
+        status:   'ok',
+        dedupe:   true,
+      };
+    }
+  } catch (err) {
+    console.error('[dedupe] lookup failed:', err.message);
+  }
+
+  // Run AI classification
+  const ai = await runAI(env, rawInput);
+
+  // Persist to D1 — handle UNIQUE race condition
+  try {
+    await env.DB.prepare(
+      `INSERT INTO universal_memory
+         (id, dedupe_key, source, source_id, intent, raw_input, ai_response, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'ok')`
+    ).bind(id, dedupe, source, sourceId, ai.intent, rawInput, ai.response).run();
+  } catch (err) {
+    if (err.message.includes('UNIQUE') || err.message.includes('unique')) {
+      // Race: another request won — fetch and return the winner
+      const winner = await env.DB.prepare(
+        'SELECT id, intent, ai_response FROM universal_memory WHERE dedupe_key = ?'
+      ).bind(dedupe).first().catch(() => null);
+
+      if (winner) {
+        return {
+          id:       winner.id,
+          intent:   winner.intent,
+          response: winner.ai_response,
+          status:   'ok',
+          dedupe:   true,
+        };
+      }
+    }
+
+    // Non-dedupe error — record it
+    const errId = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO universal_memory
+         (id, dedupe_key, source, source_id, intent, raw_input, status, error_message)
+       VALUES (?, ?, ?, ?, 'memory_log', ?, 'error', ?)`
+    ).bind(errId, dedupe + ':err', source, sourceId, rawInput, err.message).run().catch(() => {});
+
+    console.error('[d1] insert failed:', err.message);
+    return { id: errId, intent: 'memory_log', response: 'Error logged.', status: 'error' };
+  }
+
+  // Emit downstream actions
+  await emitNext(env, { source, ai, rawInput });
+
+  return { id, intent: ai.intent, response: ai.response, status: 'ok' };
+}
+
+// ─── Emit downstream ──────────────────────────────────────────────────────────
+
+async function emitNext(env, { source, ai, rawInput }) {
+  if (ai.intent === 'hot_lead' || ai.intent === 'task') {
+    await tgSend(
+      env,
+      env.ADMIN_CHAT_ID,
+      `[${ai.intent.toUpperCase()}] via ${source}\n\n${rawInput}\n\n→ ${ai.response}`
+    );
+  }
+}
+
 // ─── Workers AI ───────────────────────────────────────────────────────────────
 
 async function runAI(env, rawInput) {
@@ -116,10 +179,11 @@ async function runAI(env, rawInput) {
     {
       role: 'system',
       content:
-        'You are a tactical AI classifier. ' +
+        'You are a tactical AI classifier and responder. ' +
         'Classify the input into exactly one intent: hot_lead | task | memory_log | query. ' +
-        'Then write a short tactical response (max 2 sentences). ' +
-        'Reply ONLY with compact JSON: {"intent":"<intent>","response":"<response>"}',
+        'Generate a short tactical response (max 2 sentences). ' +
+        'Reply ONLY with compact JSON — no markdown, no code fences: ' +
+        '{"intent":"<intent>","response":"<response>"}',
     },
     { role: 'user', content: rawInput },
   ];
@@ -127,10 +191,14 @@ async function runAI(env, rawInput) {
   try {
     const result = await env.AI.run('@cf/meta/llama-3-8b-instruct', { messages });
     const text   = result?.response ?? '';
-    const match  = text.match(/\{[\s\S]*?\}/);
+    // Extract first valid JSON object from response
+    const match  = text.match(/\{[^{}]*"intent"[^{}]*"response"[^{}]*\}/s);
     if (match) {
       const parsed = JSON.parse(match[0]);
-      if (parsed.intent && parsed.response) return parsed;
+      const VALID_INTENTS = new Set(['hot_lead', 'task', 'memory_log', 'query']);
+      if (VALID_INTENTS.has(parsed.intent) && typeof parsed.response === 'string') {
+        return { intent: parsed.intent, response: parsed.response.slice(0, 500) };
+      }
     }
   } catch (err) {
     console.error('[ai] run failed:', err.message);
@@ -142,6 +210,7 @@ async function runAI(env, rawInput) {
 // ─── Telegram send ────────────────────────────────────────────────────────────
 
 async function tgSend(env, chatId, text) {
+  if (!env.TELEGRAM_BOT_TOKEN || !chatId) return;
   try {
     const res = await fetch(
       `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`,
@@ -152,20 +221,30 @@ async function tgSend(env, chatId, text) {
       }
     );
     if (!res.ok) {
-      console.error('[tg] send failed status=', res.status);
+      const body = await res.text().catch(() => '');
+      console.error('[tg] send failed status=', res.status, body);
     }
   } catch (err) {
     console.error('[tg] send threw:', err.message);
   }
 }
 
-// ─── Auth ─────────────────────────────────────────────────────────────────────
+// ─── Dedupe key (SHA-256) ─────────────────────────────────────────────────────
+
+async function dedupeKey(source, sourceId, rawInput) {
+  const data = `${source}:${sourceId}:${rawInput}`;
+  const buf  = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(data));
+  return Array.from(new Uint8Array(buf))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+// ─── Auth (constant-time) ─────────────────────────────────────────────────────
 
 function authKey(request, env) {
   const provided = request.headers.get('X-HUB-KEY') ?? '';
   const expected = env.HUB_AUTH_KEY ?? '';
   if (!expected || provided.length !== expected.length) return false;
-  // constant-time comparison
   const a = new TextEncoder().encode(provided);
   const b = new TextEncoder().encode(expected);
   let diff = 0;
